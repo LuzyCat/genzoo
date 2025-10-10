@@ -146,3 +146,12 @@ dmypy.json
 .pyre/
 /checkpoints/
 /data/
+
+# Output
+/output
+/Leopard_Cat_res
+
+# Test inputs
+/img
+/input
+/Leopard_Cat_mv

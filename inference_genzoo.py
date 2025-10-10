@@ -1,3 +1,10 @@
+import os
+os.environ.setdefault("PYGLET_HEADLESS", "1")        # pyglet 완전 headless
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl") # 또는 "egl"
+
+import pyglet
+pyglet.options['headless'] = True
+
 import torch
 import numpy as np
 import argparse
@@ -5,6 +12,16 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 import cv2
+import matplotlib
+import sys
+
+matplotlib.use("Agg")
+
+# Ensure project root (contains both genzoo and nature3d packages) is importable
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
 from hmr2.models import load_hmr2
 from hmr2.utils import recursive_to
 from hmr2.datasets.vitdet_dataset import ViTDetDataset
@@ -15,6 +32,13 @@ from utils import (
     MeshRenderer,
     overlay_rgba_on_rgb,
 )
+from nature3d.joint_utils import (
+    SMAL_JOINT_NAMES,
+    SMAL_JOINT_PARENTS,
+    export_joints_to_json,
+    draw_skeleton,
+)
+from nature3d.utils import convert_opencv_to_unity
 
 LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 
@@ -44,15 +68,20 @@ def collect_valid_images(input_paths):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "input", nargs="+", help="Input image paths (files or directories)"
+        "input", nargs="+", help="Input image paths (files or directories)", default=["./example_input"]
     )
     parser.add_argument(
         "--checkpoint",
-        default="./checkpoints/GenZoo_1M.ckpt",
+        default="./data/genzoo_1M.ckpt",
         help="Model checkpoint path",
     )
     parser.add_argument("--output", default="./output", help="Output folder path")
     parser.add_argument("--render", action="store_true", help="Render samples")
+    parser.add_argument(
+        "--export-unity",
+        action="store_true",
+        help="Also export Unity coordinate meshes and joint jsons",
+    )
     args = parser.parse_args()
 
     valid_images = collect_valid_images(args.input)
@@ -69,8 +98,17 @@ def main():
     output_folder = Path(args.output)
     obj_folder = output_folder / "obj"
     data_folder = output_folder / "data"
+    pose_folder = output_folder / "poses"
     data_folder.mkdir(parents=True, exist_ok=True)
     obj_folder.mkdir(parents=True, exist_ok=True)
+    pose_folder.mkdir(parents=True, exist_ok=True)
+    unity_obj_folder = None
+    unity_data_folder = None
+    if args.export_unity:
+        unity_obj_folder = output_folder / "obj_unity"
+        unity_data_folder = output_folder / "data_unity"
+        unity_obj_folder.mkdir(parents=True, exist_ok=True)
+        unity_data_folder.mkdir(parents=True, exist_ok=True)
         
     if args.render:
         all_params = []
@@ -121,7 +159,52 @@ def main():
             vertices_2d=vertices_2d,
         )
         save_vertices_obj(verts, hmr2.smpl.faces, obj_folder / f"{base_name}.obj")
-        
+
+        # Export SMAL+ joint data and visualization alongside mesh assets
+        joints = keypoints_3d
+        joint_count = joints.shape[0]
+        if joint_count != len(SMAL_JOINT_NAMES):
+            print(
+                f"Warning: expected {len(SMAL_JOINT_NAMES)} joints, got {joint_count}. "
+                "Joint metadata will be truncated."
+            )
+        joint_names = SMAL_JOINT_NAMES[:joint_count]
+        parents = SMAL_JOINT_PARENTS[:joint_count]
+
+        joints_json_path = data_folder / f"{base_name}_joints.json"
+        try:
+            export_joints_to_json(joints, str(joints_json_path), joint_names, parents)
+        except Exception as exc:
+            print(f"Failed to export joint json for {base_name}: {exc}")
+        else:
+            pass
+            # print(f"Joint json saved to {joints_json_path}")
+
+        pose_image_path = pose_folder / f"{base_name}_pose.png"
+        try:
+            draw_skeleton(joints, output_path=str(pose_image_path), title=f"{base_name} 3D Pose")
+        except Exception as exc:
+            print(f"Failed to render 3D pose for {base_name}: {exc}")
+        else:
+            pass
+            # print(f"3D pose visualization saved to {pose_image_path}")
+
+        if args.export_unity:
+            root_joint = joints[0] if joints.size else np.zeros(3)
+            try:
+                unity_vertices = convert_opencv_to_unity(verts, root_joint)
+                unity_joints = convert_opencv_to_unity(joints, root_joint)
+
+                unity_obj_path = unity_obj_folder / f"{base_name}_unity.obj"
+                save_vertices_obj(unity_vertices, hmr2.smpl.faces, unity_obj_path)
+                # print(f"Unity mesh saved to {unity_obj_path}")
+
+                unity_joints_json = unity_data_folder / f"{base_name}_joints_unity.json"
+                export_joints_to_json(unity_joints, str(unity_joints_json), joint_names, parents)
+                # print(f"Unity joints json saved to {unity_joints_json}")
+            except Exception as exc:
+                print(f"Failed to export Unity assets for {base_name}: {exc}")
+
         if args.render:
             # Store parameters for rendering
             all_params.append({

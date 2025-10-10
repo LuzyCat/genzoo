@@ -1,6 +1,12 @@
 import os
 if 'PYOPENGL_PLATFORM' not in os.environ:
     os.environ['PYOPENGL_PLATFORM'] = 'egl'
+os.environ["PYGLET_HEADLESS"] = "1"
+try:
+    import pyglet
+    pyglet.options['headless'] = True
+except Exception:
+    pass
 import torch
 from torchvision.utils import make_grid
 import numpy as np
