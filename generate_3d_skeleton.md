@@ -70,3 +70,31 @@
   ```
   - similarity 단계 Chamfer ≈ 0.1486 → shape 단계 후 0.0883으로 감소
   - 산출물: `genzoo/smal_fit_roe_deer/similarity_only_unity.obj`, `shape_fit_unity.obj`, 대응하는 joints/params npz
+- 좌표계를 Unity(+Z forward, +Y up)로 재정의한 후 동일 파이프라인을 반복 실행하였다.  
+  ```
+  python genzoo/fit_smal_pose_from_mesh.py \
+      origin/Roe_Deer/origin.obj \
+      --baseline-npz genzoo/output/data/Roe_deer.npz \
+      --shape-only \
+      --output-dir genzoo/smal_fit_roe_deer \
+      --iterations 200 \
+      --samples 4096
+  ```
+  - yaw 보정량은 ≈ +4°, 전방 축 정렬이 origin.obj와 일치
+  - Chamfer: 0.1479 → 0.0921 (shape 단계)
+  - scale prior를 bbox 기반으로 초기화하고 유지(≈0.39)하여 원본과 크기 차이를 해소
+  - 결과물은 `genzoo/smal_fit_roe_deer/shape_fit_unity.obj` 등으로 저장
+- 포즈를 선행 최적화한 뒤 shape를 보정하도록 파이프라인을 확장했다. 귀/다리 영역에 높은 가중치를 주는 anchor loss(관절 카테고리 기반)와 좌우 대칭 규제(SYMMETRIC_JOINT_PAIRS)를 추가했다.  
+  ```
+  python genzoo/fit_smal_pose_from_mesh.py \
+      origin/Roe_Deer/origin.obj \
+      --baseline-npz genzoo/output/data/Roe_deer.npz \
+      --shape-only \
+      --output-dir genzoo/smal_fit_roe_deer \
+      --iterations 100 \
+      --samples 2048
+  ```
+  - 유사변환 정합: Chamfer 0.051 → 포즈 단계 0.0327 → shape 단계 0.0260
+  - 익힌 가중치 덕분에 귀·발목 인근 오차가 감소, `pose_fit_unity.obj`, `shape_fit_unity.obj` 등 추가 산출
+  - 여전히 귀 끝/발굽 세부는 SMAL shape subspace 한계로 완전 일치하진 않음 → 추가 anchor 또는 개별 파라미터 필요
+- `hmr2/utils/pose_utils.compute_similarity_transform`를 활용해 anchor joint(머리/귀/앞·뒷다리) 중심으로 추정한 대응점에 대해 Procrustes 기반 초깃값(scale/rotation/translation)을 계산, bbox 기반 초기화의 불안정을 해소했다. `hmr2/utils/geometry`의 회전 변환과 기존 `batch_rodrigues`를 조합해 포즈·형상 업데이트를 수행했다.

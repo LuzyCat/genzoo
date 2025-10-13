@@ -16,6 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from nature3d.joint_utils import (
     SMAL_JOINT_NAMES,
     SMAL_JOINT_PARENTS,
+    JOINT_CATEGORIES,
+    SYMMETRIC_JOINT_PAIRS,
     export_joints_to_json,
 )
 from nature3d.utils import convert_opencv_to_unity
@@ -67,7 +69,36 @@ def load_baseline_parameters(npz_path: str, smal_model: SMALLayer):
         body_pose_mats = torch.cat([body_pose_mats, identity], dim=0)
     body_pose_mat = body_pose_mats.unsqueeze(0)
 
-    return betas, body_pose_mat, global_orient_mat
+    body_pose_axis = matrix_to_axis_angle(body_pose_mat.view(-1, 3, 3)).view(
+        1, smal_model.NUM_BODY_JOINTS, 3
+    )
+    global_orient_axis = matrix_to_axis_angle(global_orient_mat.view(-1, 3, 3)).view(1, 3)
+
+    return {
+        "betas": betas,
+        "body_pose_axis": body_pose_axis,
+        "body_pose_mat": body_pose_mat,
+        "global_orient_axis": global_orient_axis,
+        "global_orient_mat": global_orient_mat,
+    }
+
+
+HEAD_ANCHOR_JOINTS = sorted(
+    set(JOINT_CATEGORIES.get("head", []) + [32, 33, 34])
+)
+FRONT_LEG_JOINTS = JOINT_CATEGORIES.get("front_legs", [])
+BACK_LEG_JOINTS = JOINT_CATEGORIES.get("back_legs", [])
+
+ANCHOR_CONFIG = [
+    {"name": "head", "joints": HEAD_ANCHOR_JOINTS, "weight": 2.5},
+    {"name": "ears", "joints": [33, 34], "weight": 3.0},
+    {"name": "front_legs", "joints": FRONT_LEG_JOINTS, "weight": 1.6},
+    {"name": "back_legs", "joints": BACK_LEG_JOINTS, "weight": 1.6},
+]
+
+ANCHOR_SIGMA = 0.08
+SYMMETRY_WEIGHT = 0.02
+SMAL_JOINT_PARENTS_TENSOR = torch.tensor(SMAL_JOINT_PARENTS, dtype=torch.long)
 
 
 def estimate_scale_from_bbox(
@@ -123,6 +154,47 @@ def align_forward_to_axis(vertices: np.ndarray, joints: np.ndarray, head_index: 
     return vertices_rot, joints_rot, yaw
 
 
+def compute_anchor_weights(
+    points: torch.Tensor,
+    joints: torch.Tensor,
+    anchor_cfg = None,
+    sigma: float = ANCHOR_SIGMA,
+) -> torch.Tensor:
+    if anchor_cfg is None or len(anchor_cfg) == 0:
+        return torch.ones(points.shape[0], device=points.device, dtype=points.dtype)
+
+    weights = torch.ones(points.shape[0], device=points.device, dtype=points.dtype)
+    sigma_tensor = torch.tensor(sigma, device=points.device, dtype=points.dtype)
+
+    for cfg in anchor_cfg:
+        joint_ids = cfg.get("joints", [])
+        if not joint_ids:
+            continue
+        weight_val = cfg.get("weight", 1.0)
+        joint_positions = joints[joint_ids]
+        dists = torch.cdist(points, joint_positions)
+        influence = torch.exp(-dists / sigma_tensor)
+        weights = weights + weight_val * influence.max(dim=1)[0]
+
+    return weights
+
+
+def compute_symmetry_penalty(joints: torch.Tensor) -> torch.Tensor:
+    parents = SMAL_JOINT_PARENTS_TENSOR.to(joints.device)
+    penalties = []
+    for left, right in SYMMETRIC_JOINT_PAIRS:
+        left_parent = parents[left]
+        right_parent = parents[right]
+        if left_parent < 0 or right_parent < 0:
+            continue
+        left_vec = joints[left] - joints[left_parent]
+        right_vec = joints[right] - joints[right_parent]
+        penalties.append((left_vec.norm() - right_vec.norm()).abs())
+    if not penalties:
+        return torch.tensor(0.0, device=joints.device, dtype=joints.dtype)
+    return torch.stack(penalties).mean()
+
+
 def run_similarity_alignment(
     mesh_points: torch.Tensor,
     smal_model: SMALLayer,
@@ -167,7 +239,13 @@ def run_similarity_alignment(
         pred_vertices = smal_out.vertices * scale + transl
         pred_subset = pred_vertices[0, subset]
 
-        loss_data = chamfer_distance(pred_subset, target_points)
+        joints_current = (smal_out.joints * scale + transl)[0]
+        weights_pred = compute_anchor_weights(pred_subset, joints_current, ANCHOR_CONFIG, ANCHOR_SIGMA)
+        weights_target = compute_anchor_weights(target_points, joints_current, ANCHOR_CONFIG, ANCHOR_SIGMA)
+        dists = torch.cdist(pred_subset, target_points)
+        loss_xy = (weights_pred * dists.min(dim=1)[0]).sum() / weights_pred.sum()
+        loss_yx = (weights_target * dists.min(dim=0)[0]).sum() / weights_target.sum()
+        loss_data = loss_xy + loss_yx
         loss_reg = 5e-5 * global_orient.pow(2).mean()
         loss_reg = loss_reg + 5e-2 * (scale - scale_init) ** 2
         loss = loss_data + loss_reg
@@ -179,8 +257,11 @@ def run_similarity_alignment(
             best_loss = current_loss
             best_state = {
                 "betas": betas.detach().cpu().clone(),
-                "body_pose": body_pose_mat.detach().cpu().clone(),
-                "global_orient": global_orient.detach().cpu().clone(),
+                "body_pose_mat": body_pose_mat.detach().cpu().clone(),
+                "body_pose_axis": matrix_to_axis_angle(body_pose_mat.view(-1, 3, 3)).view(
+                    1, smal_model.NUM_BODY_JOINTS, 3
+                ).detach().cpu().clone(),
+                "global_orient_axis": global_orient.detach().cpu().clone(),
                 "transl": transl.detach().cpu().clone(),
                 "scale": torch.exp(log_scale.detach().cpu()).clone(),
                 "loss": current_loss,
@@ -200,74 +281,149 @@ def run_optimization(
     mesh_points: torch.Tensor,
     smal_model: SMALLayer,
     betas_init: torch.Tensor,
-    body_pose_mat: torch.Tensor,
-    global_orient_init: torch.Tensor,
+    body_pose_axis_init: torch.Tensor,
+    global_orient_axis_init: torch.Tensor,
     transl_init: torch.Tensor,
-    scale_init: torch.Tensor,
+    scale_init: float,
     iterations: int = 400,
     point_subset: int = 2048,
     device: torch.device = torch.device("cpu"),
+    train_betas: bool = True,
+    train_pose: bool = False,
     train_global: bool = True,
+    anchor_cfg=None,
+    anchor_sigma: float = ANCHOR_SIGMA,
     betas_prior: torch.Tensor | None = None,
+    pose_prior: torch.Tensor | None = None,
+    symmetry_weight: float = SYMMETRY_WEIGHT,
 ):
     vert_count = smal_model.v_template.shape[-2]
     subset = np.random.choice(vert_count, size=min(point_subset, vert_count), replace=False)
     subset = torch.tensor(subset, device=device, dtype=torch.long)
 
-    betas = betas_init.to(device).clone().detach().requires_grad_(True)
-    body_pose_mat = body_pose_mat.to(device)
-    global_orient = global_orient_init.to(device).clone().detach().requires_grad_(train_global)
-    transl = transl_init.to(device).clone().detach().requires_grad_(train_global)
-    scale_tensor = torch.tensor([[scale_init]], dtype=torch.float32, device=device)
-    log_scale = scale_tensor.log().detach().requires_grad_(train_global)
+    betas = betas_init.to(device).clone().detach()
+    if train_betas:
+        betas.requires_grad_(True)
 
-    params = [betas]
+    body_pose_axis = body_pose_axis_init.to(device).clone().detach()
+    if train_pose:
+        body_pose_axis.requires_grad_(True)
+
+    global_orient_axis = global_orient_axis_init.to(device).clone().detach()
     if train_global:
-        params.extend([global_orient, transl, log_scale])
+        global_orient_axis.requires_grad_(True)
 
-    optimiser = torch.optim.Adam(params, lr=0.01)
+    transl = transl_init.to(device).clone().detach()
+    if train_global:
+        transl.requires_grad_(True)
+
+    scale_tensor = torch.tensor([[scale_init]], dtype=torch.float32, device=device)
+    log_scale = scale_tensor.log().detach()
+    if train_global:
+        log_scale.requires_grad_(True)
+
+    params = []
+    if train_betas:
+        params.append(betas)
+    if train_pose:
+        params.append(body_pose_axis)
+    if train_global:
+        params.extend([global_orient_axis, transl, log_scale])
+
+    if params:
+        optimiser = torch.optim.Adam(params, lr=0.01)
+    else:
+        optimiser = None
 
     target_points = mesh_points
 
     best_state = None
     best_loss = float("inf")
 
+    def _record_state(loss_value: float):
+        nonlocal best_state, best_loss
+        if loss_value < best_loss:
+            best_loss = loss_value
+            best_state = {
+                "betas": betas.detach().cpu().clone(),
+                "body_pose_axis": body_pose_axis.detach().cpu().clone(),
+                "global_orient_axis": global_orient_axis.detach().cpu().clone(),
+                "transl": transl.detach().cpu().clone(),
+                "scale": torch.exp(log_scale.detach().cpu()).clone(),
+                "loss": loss_value,
+            }
+
+    if optimiser is None:
+        with torch.no_grad():
+            scale = torch.exp(log_scale)
+            body_pose_mat = batch_rodrigues(body_pose_axis.view(-1, 3)).view(1, smal_model.NUM_BODY_JOINTS, 3, 3)
+            global_orient_mat = batch_rodrigues(global_orient_axis).view(1, 1, 3, 3)
+            smal_out = smal_model(
+                betas=betas,
+                body_pose=body_pose_mat,
+                global_orient=global_orient_mat,
+                pose2rot=False,
+            )
+            pred_vertices = smal_out.vertices * scale + transl
+            pred_subset = pred_vertices[0, subset]
+            joints_current = (smal_out.joints * scale + transl)[0]
+            weights_pred = compute_anchor_weights(pred_subset, joints_current, anchor_cfg, anchor_sigma)
+            weights_target = compute_anchor_weights(target_points, joints_current, anchor_cfg, anchor_sigma)
+            dists = torch.cdist(pred_subset, target_points)
+            loss_xy = (weights_pred * dists.min(dim=1)[0]).sum() / weights_pred.sum()
+            loss_yx = (weights_target * dists.min(dim=0)[0]).sum() / weights_target.sum()
+            loss_total = (loss_xy + loss_yx).item()
+            best_loss = loss_total
+            best_state = {
+                "betas": betas.detach().cpu().clone(),
+                "body_pose_axis": body_pose_axis.detach().cpu().clone(),
+                "global_orient_axis": global_orient_axis.detach().cpu().clone(),
+                "transl": transl.detach().cpu().clone(),
+                "scale": torch.exp(log_scale.detach().cpu()).clone(),
+                "loss": loss_total,
+            }
+        print(f"Best loss: {best_loss:.6f}")
+        return best_state
+
     for step in range(iterations):
         optimiser.zero_grad()
 
         scale = torch.exp(log_scale)
-        body_pose_eval = body_pose_mat
-        global_orient_mat = batch_rodrigues(global_orient).view(1, 1, 3, 3)
+        body_pose_mat = batch_rodrigues(body_pose_axis.view(-1, 3)).view(1, smal_model.NUM_BODY_JOINTS, 3, 3)
+        global_orient_mat = batch_rodrigues(global_orient_axis).view(1, 1, 3, 3)
         smal_out = smal_model(
             betas=betas,
-            body_pose=body_pose_eval,
+            body_pose=body_pose_mat,
             global_orient=global_orient_mat,
             pose2rot=False,
         )
         pred_vertices = smal_out.vertices * scale + transl
         pred_subset = pred_vertices[0, subset]
+        joints_current = (smal_out.joints * scale + transl)[0]
 
-        loss_data = chamfer_distance(pred_subset, target_points)
-        loss_reg = 0.0
-        if betas_prior is not None:
-            loss_reg = 5e-4 * (betas - betas_prior.to(device)).pow(2).mean()
+        weights_pred = compute_anchor_weights(pred_subset, joints_current, anchor_cfg, anchor_sigma)
+        weights_target = compute_anchor_weights(target_points, joints_current, anchor_cfg, anchor_sigma)
+        dists = torch.cdist(pred_subset, target_points)
+        loss_xy = (weights_pred * dists.min(dim=1)[0]).sum() / weights_pred.sum()
+        loss_yx = (weights_target * dists.min(dim=0)[0]).sum() / weights_target.sum()
+        loss_data = loss_xy + loss_yx
+
+        loss_reg = torch.tensor(0.0, device=device, dtype=loss_data.dtype)
+        if betas_prior is not None and train_betas:
+            loss_reg = loss_reg + 5e-4 * (betas - betas_prior.to(device)).pow(2).mean()
+        if pose_prior is not None and train_pose:
+            loss_reg = loss_reg + 2e-4 * (body_pose_axis - pose_prior.to(device)).pow(2).mean()
         if train_global:
-            loss_reg = loss_reg + 5e-5 * global_orient.pow(2).mean()
+            loss_reg = loss_reg + 5e-5 * global_orient_axis.pow(2).mean()
+        if symmetry_weight > 0:
+            loss_reg = loss_reg + symmetry_weight * compute_symmetry_penalty(joints_current)
+
         loss = loss_data + loss_reg
         loss.backward()
         optimiser.step()
 
         current_loss = loss.item()
-        if current_loss < best_loss:
-            best_loss = current_loss
-            best_state = {
-                "betas": betas.detach().cpu().clone(),
-                "body_pose": body_pose_eval.detach().cpu().clone(),
-                "global_orient": global_orient.detach().cpu().clone(),
-                "transl": transl.detach().cpu().clone(),
-                "scale": torch.exp(log_scale.detach().cpu()).clone(),
-                "loss": current_loss,
-            }
+        _record_state(current_loss)
 
         if step % 50 == 0 or step == iterations - 1:
             print(
@@ -289,19 +445,35 @@ def export_results(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
-        betas = state["betas"].to(device)
-        body_pose = state["body_pose"].to(device)
-        global_orient = state["global_orient"].to(device)
-        transl = state["transl"].to(device)
-        scale = state["scale"].to(device)
+        betas = torch.as_tensor(state["betas"], device=device, dtype=torch.float32)
 
-        if body_pose.ndim == 4:
-            body_pose_mat = body_pose
+        if "body_pose_axis" in state:
+            body_pose_axis = torch.as_tensor(state["body_pose_axis"], device=device, dtype=torch.float32)
+        elif "body_pose" in state:
+            body_pose_tensor = torch.as_tensor(state["body_pose"], device=device, dtype=torch.float32)
+            if body_pose_tensor.ndim == 4:
+                body_pose_axis = matrix_to_axis_angle(body_pose_tensor.view(-1, 3, 3)).view(
+                    1, smal_model.NUM_BODY_JOINTS, 3
+                )
+            else:
+                body_pose_axis = body_pose_tensor.view(1, smal_model.NUM_BODY_JOINTS, 3)
         else:
-            body_pose_mat = batch_rodrigues(body_pose.view(-1, 3)).view(
-                1, smal_model.NUM_BODY_JOINTS, 3, 3
-            )
-        global_orient_mat = batch_rodrigues(global_orient).view(1, 1, 3, 3)
+            raise KeyError("State dict missing body pose information")
+
+        if "global_orient_axis" in state:
+            global_orient_axis = torch.as_tensor(state["global_orient_axis"], device=device, dtype=torch.float32)
+        elif "global_orient" in state:
+            global_orient_axis = torch.as_tensor(state["global_orient"], device=device, dtype=torch.float32)
+        else:
+            raise KeyError("State dict missing global orientation information")
+
+        transl = torch.as_tensor(state["transl"], device=device, dtype=torch.float32)
+        scale = torch.as_tensor(state["scale"], device=device, dtype=torch.float32)
+
+        body_pose_mat = batch_rodrigues(body_pose_axis.view(-1, 3)).view(
+            1, smal_model.NUM_BODY_JOINTS, 3, 3
+        )
+        global_orient_mat = batch_rodrigues(global_orient_axis.view(-1, 3)).view(1, 1, 3, 3)
 
         smal_out = smal_model(
             betas=betas,
@@ -330,8 +502,8 @@ def export_results(
     np.savez(
         params_path,
         betas=betas.cpu().numpy(),
-        body_pose=body_pose.cpu().numpy(),
-        global_orient=global_orient.cpu().numpy(),
+        body_pose_axis=body_pose_axis.cpu().numpy(),
+        global_orient_axis=global_orient_axis.cpu().numpy(),
         transl=transl.cpu().numpy(),
         scale=scale.cpu().numpy(),
     )
@@ -420,17 +592,25 @@ def main():
     if args.shape_only and not args.baseline_npz:
         raise ValueError("--baseline-npz must be provided when using --shape-only.")
 
-    betas_init, body_pose_mat, global_orient_mat = load_baseline_parameters(args.baseline_npz, smal_model) if args.baseline_npz else (
-        torch.zeros(1, SMALLayer.SHAPE_SPACE_DIM),
-        torch.eye(3).view(1, 1, 3, 3).repeat(1, smal_model.NUM_BODY_JOINTS, 1, 1),
-        torch.eye(3).view(1, 1, 3, 3),
-    )
+    if args.baseline_npz:
+        baseline_params = load_baseline_parameters(args.baseline_npz, smal_model)
+        betas_init = baseline_params["betas"]
+        body_pose_axis_init = baseline_params["body_pose_axis"]
+        body_pose_mat_init = baseline_params["body_pose_mat"]
+        global_orient_axis_init = baseline_params["global_orient_axis"]
+        global_orient_mat_init = baseline_params["global_orient_mat"]
+    else:
+        betas_init = torch.zeros(1, SMALLayer.SHAPE_SPACE_DIM)
+        body_pose_axis_init = torch.zeros(1, smal_model.NUM_BODY_JOINTS, 3)
+        body_pose_mat_init = torch.eye(3).view(1, 1, 3, 3).repeat(1, smal_model.NUM_BODY_JOINTS, 1, 1)
+        global_orient_axis_init = torch.zeros(1, 3)
+        global_orient_mat_init = torch.eye(3).view(1, 1, 3, 3)
 
     with torch.no_grad():
         baseline_out = smal_model(
             betas=betas_init.to(device),
-            body_pose=body_pose_mat.to(device),
-            global_orient=global_orient_mat.to(device),
+            body_pose=body_pose_mat_init.to(device),
+            global_orient=global_orient_mat_init.to(device),
             pose2rot=False,
         )
     baseline_vertices = baseline_out.vertices[0].cpu().numpy()
@@ -441,8 +621,8 @@ def main():
         mesh_points=mesh_points,
         smal_model=smal_model,
         betas=betas_init,
-        body_pose_mat=body_pose_mat,
-        global_orient_mat=global_orient_mat,
+        body_pose_mat=body_pose_mat_init,
+        global_orient_mat=global_orient_mat_init,
         scale_init=scale_guess,
         iterations=200,
         point_subset=min(2048, args.samples),
@@ -457,24 +637,59 @@ def main():
         prefix="similarity_only",
     )
 
-    global_orient_init = similarity_state["global_orient"]
+    global_orient_axis_state = similarity_state["global_orient_axis"]
     transl_init = similarity_state["transl"]
     scale_init = float(similarity_state["scale"].item())
+
+    pose_state = run_optimization(
+        mesh_points=mesh_points,
+        smal_model=smal_model,
+        betas_init=betas_init,
+        body_pose_axis_init=body_pose_axis_init,
+        global_orient_axis_init=global_orient_axis_state,
+        transl_init=transl_init,
+        scale_init=scale_init,
+        iterations=args.iterations,
+        point_subset=min(2048, args.samples),
+        device=device,
+        train_betas=False,
+        train_pose=True,
+        train_global=False,
+        anchor_cfg=ANCHOR_CONFIG,
+        anchor_sigma=ANCHOR_SIGMA,
+        pose_prior=body_pose_axis_init,
+        symmetry_weight=SYMMETRY_WEIGHT,
+    )
+
+    export_results(
+        smal_model=smal_model,
+        state=pose_state,
+        output_dir=Path(args.output_dir),
+        device=device,
+        prefix="pose_fit",
+    )
+
+    body_pose_axis_refined = pose_state["body_pose_axis"]
 
     if args.shape_only:
         shape_state = run_optimization(
             mesh_points=mesh_points,
             smal_model=smal_model,
             betas_init=betas_init,
-            body_pose_mat=body_pose_mat,
-            global_orient_init=global_orient_init,
+            body_pose_axis_init=body_pose_axis_refined,
+            global_orient_axis_init=global_orient_axis_state,
             transl_init=transl_init,
             scale_init=scale_init,
             iterations=args.iterations,
             point_subset=min(2048, args.samples),
             device=device,
+            train_betas=True,
+            train_pose=False,
             train_global=False,
+            anchor_cfg=ANCHOR_CONFIG,
+            anchor_sigma=ANCHOR_SIGMA,
             betas_prior=betas_init,
+            symmetry_weight=SYMMETRY_WEIGHT,
         )
 
         export_results(
@@ -489,15 +704,21 @@ def main():
             mesh_points=mesh_points,
             smal_model=smal_model,
             betas_init=betas_init,
-            body_pose_mat=body_pose_mat,
-            global_orient_init=global_orient_init,
+            body_pose_axis_init=body_pose_axis_refined,
+            global_orient_axis_init=global_orient_axis_state,
             transl_init=transl_init,
             scale_init=scale_init,
             iterations=args.iterations,
             point_subset=min(2048, args.samples),
             device=device,
+            train_betas=True,
+            train_pose=True,
             train_global=True,
+            anchor_cfg=ANCHOR_CONFIG,
+            anchor_sigma=ANCHOR_SIGMA,
             betas_prior=betas_init,
+            pose_prior=body_pose_axis_init,
+            symmetry_weight=SYMMETRY_WEIGHT,
         )
 
         export_results(
