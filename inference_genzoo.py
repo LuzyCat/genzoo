@@ -196,7 +196,11 @@ def main():
                 unity_joints = convert_opencv_to_unity(joints, root_joint)
 
                 unity_obj_path = unity_obj_folder / f"{base_name}_unity.obj"
-                save_vertices_obj(unity_vertices, hmr2.smpl.faces, unity_obj_path)
+                save_vertices_obj(
+                    unity_vertices,
+                    hmr2.smpl.faces,
+                    unity_obj_path,
+                )
                 # print(f"Unity mesh saved to {unity_obj_path}")
 
                 unity_joints_json = unity_data_folder / f"{base_name}_joints_unity.json"

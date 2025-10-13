@@ -146,11 +146,23 @@ def convert_to_pixel_coords(scale, tx, ty, resolution=1024):
     s_wp = scale * resolution
     return s_wp, tx_px, ty_px
 
-def save_vertices_obj(vertices, faces, save_path):
+def save_vertices_obj(vertices, faces, save_path, flip_faces=False):
+    """
+    Save vertex/face data to a simple OBJ file.
+
+    Args:
+        vertices (np.ndarray): Vertex array shaped (N, 3).
+        faces (np.ndarray): Face index array shaped (F, 3) with 0-based indices.
+        save_path (str or Path): Output path.
+        flip_faces (bool): When True, reverse the winding order of each face.
+                           Useful after reflections (det=-1) to keep normals outward.
+    """
+    faces_to_write = faces[:, [0, 2, 1]] if flip_faces else faces
+
     with open(save_path, 'w') as f:
         for v in vertices:
             f.write(f'v {v[0]} {v[1]} {v[2]}\n')
-        for face in faces + 1: 
+        for face in faces_to_write + 1:
             f.write(f'f {face[0]} {face[1]} {face[2]}\n')
 
 def deduce_randomized_weak_perspective_params(verts, img_size=(1024, 1024)):

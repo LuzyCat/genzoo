@@ -150,6 +150,7 @@ dmypy.json
 # Output
 /output
 /Leopard_Cat_res
+/smal_fit_output
 
 # Test inputs
 /img
