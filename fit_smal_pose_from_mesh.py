@@ -1,3 +1,72 @@
+"""
+GenZoo 베이스라인을 사용한 SMAL 메시 최적화 스크립트
+
+타겟 3D 메시에 SMAL 모델을 최적화하여 맞춤
+
+=== 사용법 ===
+
+최소 사용 (OBJ만):
+    python genzoo/fit_smal_pose_from_mesh.py target.obj
+
+OBJ + NPZ (베이스라인):
+    python genzoo/fit_smal_pose_from_mesh.py \
+        target.obj \
+        --baseline-npz genzoo_baseline.npz
+
+실전 예제 (Roe Deer):
+    python genzoo/fit_smal_pose_from_mesh.py \
+        Roe_Deer/Roe_Deer_unity.obj \
+        --baseline-npz genzoo_output/smal_parameters.npz \
+        --output-dir fitted_results/Roe_Deer \
+        --iterations 400 \
+        --samples 4096
+
+Shape만 최적화 (Pose 고정):
+    python genzoo/fit_smal_pose_from_mesh.py \
+        target.obj \
+        --baseline-npz baseline.npz \
+        --shape-only
+
+=== 입력 ===
+
+필수:
+    - target.obj: 타겟 3D 메시 (Unity 좌표계)
+
+선택:
+    - --baseline-npz: GenZoo로 생성한 초기 파라미터
+      (없으면 제로 초기화, 수렴 느림)
+
+=== 출력 ===
+
+{output_dir}/
+    ├── similarity_only_unity.obj       # 1단계: 위치/크기만 맞춤
+    ├── pose_fit_unity.obj              # 2단계: Pose 최적화
+    ├── smal_fit_unity.obj              # 3단계: 전체 최적화 (최종)
+    ├── smal_fit_params.npz             # 최적화된 파라미터
+    └── smal_fit_summary.json           # 요약 정보
+
+=== 최적화 프로세스 ===
+
+3단계 최적화:
+1. Similarity Alignment (200회)
+   - Scale, Rotation, Translation만 조정
+   - Shape와 Pose는 고정
+
+2. Pose Optimization (400회)
+   - Pose만 최적화
+   - Shape 고정, Scale/Rotation/Translation 고정
+
+3. Full Optimization (400회)
+   - Shape, Pose, Global 모두 최적화
+   (--shape-only 옵션 시 Shape만 최적화)
+
+Loss 구성:
+- Chamfer Distance: 메시 표면 유사도
+- Anchor Weights: 중요 부위(머리, 귀, 다리) 가중치
+- Symmetry Loss: 좌우 대칭 유지
+- Prior Loss: 베이스라인과의 차이 제한
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -8,7 +77,7 @@ import trimesh
 
 import sys
 
-# Ensure project root (contains both genzoo and nature3d packages) is importable
+# 프로젝트 루트를 Python path에 추가 (genzoo, nature3d 패키지 import 위해)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
@@ -27,21 +96,47 @@ from pytorch3d.transforms import matrix_to_axis_angle
 
 
 def unity_to_opencv(points: np.ndarray) -> np.ndarray:
-    """Invert ``convert_opencv_to_unity`` (mirror Y and Z without recentering)."""
+    """
+    Unity → OpenCV 좌표계 변환
+
+    Unity (Y-up, Z-forward) → OpenCV (Y-down, Z-forward)
+    Y와 Z축을 뒤집음 (중심점 이동 없이)
+    """
     return convert_opencv_to_unity(points, np.zeros(3, dtype=np.float32))
 
 
 def chamfer_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Simple symmetric Chamfer distance for point clouds (N,3) and (M,3)."""
-    dists = torch.cdist(x, y)
-    loss_xy = dists.min(dim=1)[0].mean()
-    loss_yx = dists.min(dim=0)[0].mean()
+    """
+    대칭 Chamfer Distance 계산
+
+    두 점군 (N,3)과 (M,3) 사이의 유사도 측정
+    - X→Y: x의 각 점에서 가장 가까운 y 점까지 거리 평균
+    - Y→X: y의 각 점에서 가장 가까운 x 점까지 거리 평균
+    - 총 거리 = X→Y + Y→X (대칭적)
+    """
+    dists = torch.cdist(x, y)  # (N, M) 거리 행렬
+    loss_xy = dists.min(dim=1)[0].mean()  # X → Y
+    loss_yx = dists.min(dim=0)[0].mean()  # Y → X
     return loss_xy + loss_yx
 
 
 def mesh_to_points(mesh: trimesh.Trimesh, num_points: int) -> np.ndarray:
+    """
+    메시 표면에서 균일하게 점 샘플링
+
+    Args:
+        mesh: 입력 3D 메시
+        num_points: 샘플링할 점의 개수
+
+    Returns:
+        (num_points, 3) 샘플 포인트 배열
+
+    Note:
+        - 메시가 watertight가 아니면 구멍을 메우려고 시도
+        - 샘플링 안정성 향상을 위함
+    """
     if not mesh.is_watertight:
-        # Try to fill holes to stabilise sampling (in-place modification)
+        # 구멍 메우기 시도 (샘플링 안정화)
         mesh = mesh.copy()
         try:
             mesh.fill_holes()
@@ -51,24 +146,54 @@ def mesh_to_points(mesh: trimesh.Trimesh, num_points: int) -> np.ndarray:
 
 
 def load_baseline_parameters(npz_path: str, smal_model: SMALLayer):
+    """
+    GenZoo 베이스라인 NPZ 파일에서 SMAL 파라미터 로드
+
+    Args:
+        npz_path: GenZoo로 생성한 .npz 파일 경로
+        smal_model: SMAL 모델 인스턴스
+
+    Returns:
+        dict: 다음 키를 포함하는 파라미터 딕셔너리
+            - betas: Shape 파라미터 (1, 41)
+            - body_pose_axis: Body pose axis-angle (1, 33, 3)
+            - body_pose_mat: Body pose 회전 행렬 (1, 33, 3, 3)
+            - global_orient_axis: Global orientation axis-angle (1, 3)
+            - global_orient_mat: Global orientation 회전 행렬 (1, 1, 3, 3)
+
+    NPZ 형식:
+        - 'pose': (J, 3, 3) 회전 행렬 배열
+        - 'beta': (41,) shape 파라미터 배열
+    """
     data = np.load(npz_path)
     if "pose" not in data or "beta" not in data:
         raise KeyError("Baseline npz must contain 'pose' and 'beta'.")
 
     pose = torch.tensor(data["pose"], dtype=torch.float32)  # (N,3,3)
-    betas = torch.tensor(data["beta"], dtype=torch.float32).view(1, -1)
+    betas_raw = torch.tensor(data["beta"], dtype=torch.float32).view(1, -1)
+    num_betas_model = getattr(smal_model, "SHAPE_SPACE_DIM", None)
+    if num_betas_model is None:
+        num_betas_model = getattr(smal_model, "num_betas", betas_raw.shape[-1])
+    betas = torch.zeros(1, num_betas_model, dtype=torch.float32)
+    n_copy = min(betas_raw.numel(), num_betas_model)
+    betas[:, :n_copy] = betas_raw[:, :n_copy]
 
     if pose.ndim != 3 or pose.shape[1:] != (3, 3):
         raise ValueError("Baseline pose must have shape (J,3,3).")
 
+    # Joint 0: Global orientation
     global_orient_mat = pose[0].unsqueeze(0).unsqueeze(0).contiguous()
+
+    # Joints 1~33: Body pose
     body_pose_mats = pose[1: 1 + smal_model.NUM_BODY_JOINTS].clone()
     if body_pose_mats.shape[0] < smal_model.NUM_BODY_JOINTS:
+        # 부족한 joint는 identity로 채움
         missing = smal_model.NUM_BODY_JOINTS - body_pose_mats.shape[0]
         identity = torch.eye(3, dtype=torch.float32).unsqueeze(0).repeat(missing, 1, 1)
         body_pose_mats = torch.cat([body_pose_mats, identity], dim=0)
     body_pose_mat = body_pose_mats.unsqueeze(0)
 
+    # 회전 행렬 → Axis-angle 변환
     body_pose_axis = matrix_to_axis_angle(body_pose_mat.view(-1, 3, 3)).view(
         1, smal_model.NUM_BODY_JOINTS, 3
     )
@@ -83,6 +208,12 @@ def load_baseline_parameters(npz_path: str, smal_model: SMALLayer):
     }
 
 
+# ====================================================================
+# Anchor 기반 가중치 설정
+# ====================================================================
+# 최적화 시 중요한 신체 부위에 더 높은 가중치를 부여
+# 머리, 귀, 다리 등 특징적인 부분을 정확하게 맞추는 것이 목표
+
 HEAD_ANCHOR_JOINTS = sorted(
     set(JOINT_CATEGORIES.get("head", []) + [32, 33, 34])
 )
@@ -90,14 +221,14 @@ FRONT_LEG_JOINTS = JOINT_CATEGORIES.get("front_legs", [])
 BACK_LEG_JOINTS = JOINT_CATEGORIES.get("back_legs", [])
 
 ANCHOR_CONFIG = [
-    {"name": "head", "joints": HEAD_ANCHOR_JOINTS, "weight": 2.5},
-    {"name": "ears", "joints": [33, 34], "weight": 3.0},
-    {"name": "front_legs", "joints": FRONT_LEG_JOINTS, "weight": 1.6},
-    {"name": "back_legs", "joints": BACK_LEG_JOINTS, "weight": 1.6},
+    {"name": "head", "joints": HEAD_ANCHOR_JOINTS, "weight": 2.5},  # 머리: 높은 가중치
+    {"name": "ears", "joints": [33, 34], "weight": 3.0},            # 귀: 매우 높은 가중치
+    {"name": "front_legs", "joints": FRONT_LEG_JOINTS, "weight": 1.6},  # 앞다리
+    {"name": "back_legs", "joints": BACK_LEG_JOINTS, "weight": 1.6},    # 뒷다리
 ]
 
-ANCHOR_SIGMA = 0.08
-SYMMETRY_WEIGHT = 0.02
+ANCHOR_SIGMA = 0.08  # Anchor 영향 범위 (작을수록 영향 범위 좁음)
+SYMMETRY_WEIGHT = 0.02  # 좌우 대칭 loss 가중치
 SMAL_JOINT_PARENTS_TENSOR = torch.tensor(SMAL_JOINT_PARENTS, dtype=torch.long)
 
 
@@ -105,6 +236,20 @@ def estimate_scale_from_bbox(
     mesh_points_cv: torch.Tensor,
     baseline_vertices: np.ndarray,
 ) -> float:
+    """
+    Bounding box 크기를 비교하여 초기 스케일 추정
+
+    Args:
+        mesh_points_cv: 타겟 메시 포인트 (OpenCV 좌표계)
+        baseline_vertices: 베이스라인 SMAL 메시 vertices
+
+    Returns:
+        float: 추정된 스케일 팩터 (target_size / baseline_size)
+
+    Note:
+        타겟 메시와 베이스라인 메시의 크기 차이를 계산하여
+        초기 최적화를 빠르게 수렴시킴
+    """
     target_extents = (mesh_points_cv.cpu().numpy().max(axis=0) - mesh_points_cv.cpu().numpy().min(axis=0))
     baseline_extents = baseline_vertices.max(axis=0) - baseline_vertices.min(axis=0)
     target_norm = np.linalg.norm(target_extents)
@@ -160,6 +305,26 @@ def compute_anchor_weights(
     anchor_cfg = None,
     sigma: float = ANCHOR_SIGMA,
 ) -> torch.Tensor:
+    """
+    Anchor 기반 가중치 계산
+
+    중요한 신체 부위(머리, 귀, 다리) 근처의 점들에 높은 가중치 부여
+
+    Args:
+        points: 메시 포인트 (N, 3)
+        joints: SMAL joint 위치 (J, 3)
+        anchor_cfg: Anchor 설정 리스트 (ANCHOR_CONFIG 참조)
+        sigma: Gaussian 영향 범위 파라미터 (작을수록 영향 범위 좁음)
+
+    Returns:
+        torch.Tensor: 각 점의 가중치 (N,)
+
+    동작 원리:
+        1. 각 점에서 anchor joint까지의 거리 계산
+        2. exp(-dist/sigma)로 거리 기반 영향도 계산
+        3. 여러 anchor의 영향을 합산하여 최종 가중치 생성
+        4. 머리/귀 근처 점들이 더 높은 가중치를 받음
+    """
     if anchor_cfg is None or len(anchor_cfg) == 0:
         return torch.ones(points.shape[0], device=points.device, dtype=points.dtype)
 
@@ -172,14 +337,31 @@ def compute_anchor_weights(
             continue
         weight_val = cfg.get("weight", 1.0)
         joint_positions = joints[joint_ids]
-        dists = torch.cdist(points, joint_positions)
-        influence = torch.exp(-dists / sigma_tensor)
-        weights = weights + weight_val * influence.max(dim=1)[0]
+        dists = torch.cdist(points, joint_positions)  # (N, num_joints)
+        influence = torch.exp(-dists / sigma_tensor)  # Gaussian 영향도
+        weights = weights + weight_val * influence.max(dim=1)[0]  # 가장 가까운 joint의 영향
 
     return weights
 
 
 def compute_symmetry_penalty(joints: torch.Tensor) -> torch.Tensor:
+    """
+    좌우 대칭 Loss 계산
+
+    대칭되는 joint 쌍(왼쪽 앞다리-오른쪽 앞다리 등)의
+    bone 길이가 같도록 제약
+
+    Args:
+        joints: SMAL joint 위치 (J, 3)
+
+    Returns:
+        torch.Tensor: 대칭 penalty (스칼라)
+
+    동작 원리:
+        - 대칭 joint 쌍에 대해 (left_bone_length - right_bone_length)의 절댓값 계산
+        - 모든 쌍의 평균을 반환
+        - 이 loss를 최소화하면 좌우 대칭이 유지됨
+    """
     parents = SMAL_JOINT_PARENTS_TENSOR.to(joints.device)
     penalties = []
     for left, right in SYMMETRIC_JOINT_PAIRS:
@@ -187,8 +369,10 @@ def compute_symmetry_penalty(joints: torch.Tensor) -> torch.Tensor:
         right_parent = parents[right]
         if left_parent < 0 or right_parent < 0:
             continue
+        # 각 joint에서 부모 joint까지의 벡터 (bone)
         left_vec = joints[left] - joints[left_parent]
         right_vec = joints[right] - joints[right_parent]
+        # Bone 길이 차이
         penalties.append((left_vec.norm() - right_vec.norm()).abs())
     if not penalties:
         return torch.tensor(0.0, device=joints.device, dtype=joints.dtype)
@@ -206,7 +390,31 @@ def run_similarity_alignment(
     point_subset: int = 2048,
     device: torch.device = torch.device("cpu"),
 ):
-    """Optimise scale/rotation/translation while keeping pose/shape fixed."""
+    """
+    1단계 최적화: Similarity Alignment (위치/크기/회전만 조정)
+
+    Shape와 Pose는 고정하고 Scale, Global Rotation, Translation만 최적화
+    타겟 메시의 위치와 크기에 대략적으로 맞춤
+
+    Args:
+        mesh_points: 타겟 메시 포인트 (N, 3)
+        smal_model: SMAL 모델 인스턴스
+        betas: 초기 shape 파라미터 (고정)
+        body_pose_mat: 초기 body pose (고정)
+        global_orient_mat: 초기 global orientation (최적화)
+        scale_init: 초기 스케일 추정값
+        iterations: 반복 횟수 (기본 200)
+        point_subset: 서브샘플링 포인트 수 (속도 향상)
+        device: torch device
+
+    Returns:
+        dict: 최적화된 파라미터
+            - betas, body_pose_mat, body_pose_axis (고정된 값 그대로)
+            - global_orient_axis (최적화됨)
+            - transl (최적화됨)
+            - scale (최적화됨)
+            - loss (최종 loss 값)
+    """
     vert_count = smal_model.v_template.shape[-2]
     subset = np.random.choice(vert_count, size=min(point_subset, vert_count), replace=False)
     subset = torch.tensor(subset, device=device, dtype=torch.long)
@@ -297,6 +505,51 @@ def run_optimization(
     pose_prior: torch.Tensor | None = None,
     symmetry_weight: float = SYMMETRY_WEIGHT,
 ):
+    """
+    2단계/3단계 최적화: Pose 최적화 또는 Full 최적화
+
+    train_* 플래그로 최적화할 파라미터 선택 가능
+
+    2단계 (Pose only):
+        train_betas=False, train_pose=True, train_global=False
+        → Pose만 최적화, Shape/Scale/Translation 고정
+
+    3단계 (Full optimization):
+        train_betas=True, train_pose=True, train_global=True
+        → Shape, Pose, Global 모두 최적화
+
+    Args:
+        mesh_points: 타겟 메시 포인트 (N, 3)
+        smal_model: SMAL 모델 인스턴스
+        betas_init: 초기 shape 파라미터
+        body_pose_axis_init: 초기 body pose (axis-angle)
+        global_orient_axis_init: 초기 global orientation (axis-angle)
+        transl_init: 초기 translation
+        scale_init: 초기 scale
+        iterations: 반복 횟수 (기본 400)
+        point_subset: 서브샘플링 포인트 수
+        device: torch device
+        train_betas: Shape 최적화 여부
+        train_pose: Pose 최적화 여부
+        train_global: Global rotation/translation/scale 최적화 여부
+        anchor_cfg: Anchor 가중치 설정
+        anchor_sigma: Anchor 영향 범위
+        betas_prior: Shape prior (None이면 prior loss 없음)
+        pose_prior: Pose prior (None이면 prior loss 없음)
+        symmetry_weight: 대칭 loss 가중치
+
+    Returns:
+        dict: 최적화된 파라미터
+            - betas, body_pose_axis, global_orient_axis
+            - transl, scale
+            - loss (최종 loss 값)
+
+    Loss 구성:
+        1. Data loss: Anchor-weighted Chamfer distance
+        2. Prior loss: 베이스라인과의 차이 제한
+        3. Regularization: 과도한 변형 방지
+        4. Symmetry loss: 좌우 대칭 유지
+    """
     vert_count = smal_model.v_template.shape[-2]
     subset = np.random.choice(vert_count, size=min(point_subset, vert_count), replace=False)
     subset = torch.tensor(subset, device=device, dtype=torch.long)
@@ -440,8 +693,30 @@ def export_results(
     state: dict,
     output_dir: Path,
     device: torch.device,
+    target_points_cv: torch.Tensor,
     prefix: str = "smal_fit",
 ):
+    """
+    최적화 결과를 파일로 출력
+
+    출력 파일:
+        1. {prefix}_unity.obj: Unity 좌표계 메시
+        2. {prefix}_unity_joints.json: Joint 위치 (Unity)
+        3. {prefix}_params.npz: 최적화된 SMAL 파라미터
+        4. {prefix}_summary.json: 요약 정보 (loss, metrics)
+
+    Args:
+        smal_model: SMAL 모델 인스턴스
+        state: 최적화된 파라미터 딕셔너리
+        output_dir: 출력 디렉토리
+        device: torch device
+        target_points_cv: 타겟 메시 포인트 (OpenCV 좌표계)
+        prefix: 출력 파일명 접두사
+
+    생성되는 메트릭:
+        - chamfer_to_mesh: 타겟 메시와의 Chamfer distance
+        - anchor_surface_distance: 주요 joint와 메시 표면 간 거리
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
@@ -508,11 +783,38 @@ def export_results(
         scale=scale.cpu().numpy(),
     )
 
+    metrics = {}
+    try:
+        pred_points = torch.tensor(verts_np, device=device, dtype=target_points_cv.dtype)
+        metrics["chamfer_to_mesh"] = float(chamfer_distance(pred_points, target_points_cv).item())
+    except Exception as exc:
+        print(f"⚠️  Chamfer evaluation failed: {exc}")
+        metrics["chamfer_to_mesh"] = None
+
+    anchor_joint_ids = {
+        "root": 0,
+        "head": 16,
+        "pelvis": 1,
+        "tail_base": 25,
+    }
+    target_np = target_points_cv.cpu().numpy()
+    anchor_errors = {}
+    for name, idx in anchor_joint_ids.items():
+        if idx < joints_np.shape[0]:
+            anchor = joints_np[idx]
+            diffs = target_np - anchor
+            dists = np.linalg.norm(diffs, axis=1)
+            anchor_errors[name] = float(dists.min())
+        else:
+            anchor_errors[name] = None
+    metrics["anchor_surface_distance"] = anchor_errors
+
     meta = {
         "obj_path": str(obj_path),
         "joints_json": str(joints_json),
         "params_path": str(params_path),
         "best_loss": float(state.get("loss", 0.0)),
+        "metrics": metrics,
         # "yaw_applied_deg": float(np.degrees(yaw_rad)),
     }
     meta_path = output_dir / f"{prefix}_summary.json"
@@ -525,6 +827,19 @@ def export_results(
 
 
 def main():
+    """
+    메인 실행 함수: 타겟 메시에 SMAL 최적화
+
+    전체 파이프라인:
+        1. 타겟 메시 로드 및 샘플링
+        2. SMAL 모델 초기화
+        3. 베이스라인 파라미터 로드 (있으면)
+        4. 3단계 최적화:
+           - 1단계: Similarity alignment (위치/크기/회전)
+           - 2단계: Pose optimization
+           - 3단계: Full optimization (shape + pose + global)
+        5. 각 단계별 결과 저장
+    """
     parser = argparse.ArgumentParser(description="Fit SMAL pose/shape to a Unity mesh.")
     parser.add_argument("mesh_path", type=str, help="Target mesh (Unity coordinate system).")
     parser.add_argument(
@@ -576,14 +891,22 @@ def main():
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
+    # ====================================================================
+    # 1. 타겟 메시 로드 및 샘플링
+    # ====================================================================
     mesh = trimesh.load_mesh(mesh_path, process=False)
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("Input mesh must be a single Trimesh.")
 
+    # 메시 표면에서 균일하게 포인트 샘플링
     mesh_points_np = mesh_to_points(mesh, args.samples)
+    # Unity → OpenCV 좌표계 변환 (최적화는 OpenCV 좌표계에서 수행)
     mesh_points_cv = unity_to_opencv(mesh_points_np.astype(np.float32))
     mesh_points = torch.tensor(mesh_points_cv, device=device, dtype=torch.float32)
 
+    # ====================================================================
+    # 2. SMAL 모델 초기화
+    # ====================================================================
     smal_model = SMALLayer(
         model_path=args.model_path,
         num_betas=SMALLayer.SHAPE_SPACE_DIM,
@@ -592,7 +915,11 @@ def main():
     if args.shape_only and not args.baseline_npz:
         raise ValueError("--baseline-npz must be provided when using --shape-only.")
 
+    # ====================================================================
+    # 3. 베이스라인 파라미터 로드 (또는 제로 초기화)
+    # ====================================================================
     if args.baseline_npz:
+        # GenZoo/AniMer로 생성한 초기 파라미터 사용
         baseline_params = load_baseline_parameters(args.baseline_npz, smal_model)
         betas_init = baseline_params["betas"]
         body_pose_axis_init = baseline_params["body_pose_axis"]
@@ -600,12 +927,14 @@ def main():
         global_orient_axis_init = baseline_params["global_orient_axis"]
         global_orient_mat_init = baseline_params["global_orient_mat"]
     else:
+        # 베이스라인 없으면 제로 초기화 (수렴 느림)
         betas_init = torch.zeros(1, SMALLayer.SHAPE_SPACE_DIM)
         body_pose_axis_init = torch.zeros(1, smal_model.NUM_BODY_JOINTS, 3)
         body_pose_mat_init = torch.eye(3).view(1, 1, 3, 3).repeat(1, smal_model.NUM_BODY_JOINTS, 1, 1)
         global_orient_axis_init = torch.zeros(1, 3)
         global_orient_mat_init = torch.eye(3).view(1, 1, 3, 3)
 
+    # 초기 스케일 추정 (타겟과 베이스라인의 크기 비율)
     with torch.no_grad():
         baseline_out = smal_model(
             betas=betas_init.to(device),
@@ -616,6 +945,11 @@ def main():
     baseline_vertices = baseline_out.vertices[0].cpu().numpy()
     scale_guess = estimate_scale_from_bbox(mesh_points, baseline_vertices)
 
+    # ====================================================================
+    # 4. 1단계 최적화: Similarity Alignment
+    # ====================================================================
+    # Shape와 Pose 고정, Scale/Rotation/Translation만 최적화
+    # 타겟 메시의 대략적인 위치와 크기에 맞춤
     print("Running similarity-only alignment (scale + rotation + translation)...")
     similarity_state = run_similarity_alignment(
         mesh_points=mesh_points,
@@ -629,18 +963,26 @@ def main():
         device=device,
     )
 
+    # 1단계 결과 저장
     export_results(
         smal_model=smal_model,
         state=similarity_state,
         output_dir=Path(args.output_dir),
         device=device,
+        target_points_cv=mesh_points,
         prefix="similarity_only",
     )
 
+    # 1단계 결과를 2단계의 초기값으로 사용
     global_orient_axis_state = similarity_state["global_orient_axis"]
     transl_init = similarity_state["transl"]
     scale_init = float(similarity_state["scale"].item())
 
+    # ====================================================================
+    # 5. 2단계 최적화: Pose Optimization
+    # ====================================================================
+    # Shape/Scale/Translation 고정, Pose만 최적화
+    # 관절의 자세를 타겟 메시에 맞춤
     pose_state = run_optimization(
         mesh_points=mesh_points,
         smal_model=smal_model,
@@ -652,26 +994,33 @@ def main():
         iterations=args.iterations,
         point_subset=min(2048, args.samples),
         device=device,
-        train_betas=False,
-        train_pose=True,
-        train_global=False,
+        train_betas=False,  # Shape 고정
+        train_pose=True,    # Pose 최적화
+        train_global=False, # Scale/Translation 고정
         anchor_cfg=ANCHOR_CONFIG,
         anchor_sigma=ANCHOR_SIGMA,
-        pose_prior=body_pose_axis_init,
+        pose_prior=body_pose_axis_init,  # Prior로 베이스라인과 크게 벗어나지 않도록
         symmetry_weight=SYMMETRY_WEIGHT,
     )
 
+    # 2단계 결과 저장
     export_results(
         smal_model=smal_model,
         state=pose_state,
         output_dir=Path(args.output_dir),
         device=device,
+        target_points_cv=mesh_points,
         prefix="pose_fit",
     )
 
+    # 2단계 결과를 3단계의 초기값으로 사용
     body_pose_axis_refined = pose_state["body_pose_axis"]
 
+    # ====================================================================
+    # 6. 3단계 최적화: Full Optimization (또는 Shape Only)
+    # ====================================================================
     if args.shape_only:
+        # --shape-only 옵션: Pose/Global 고정, Shape만 최적화
         shape_state = run_optimization(
             mesh_points=mesh_points,
             smal_model=smal_model,
@@ -683,23 +1032,26 @@ def main():
             iterations=args.iterations,
             point_subset=min(2048, args.samples),
             device=device,
-            train_betas=True,
-            train_pose=False,
-            train_global=False,
+            train_betas=True,   # Shape 최적화
+            train_pose=False,   # Pose 고정
+            train_global=False, # Scale/Translation 고정
             anchor_cfg=ANCHOR_CONFIG,
             anchor_sigma=ANCHOR_SIGMA,
             betas_prior=betas_init,
             symmetry_weight=SYMMETRY_WEIGHT,
         )
 
+        # Shape-only 결과 저장
         export_results(
             smal_model=smal_model,
             state=shape_state,
             output_dir=Path(args.output_dir),
             device=device,
+            target_points_cv=mesh_points,
             prefix="shape_fit",
         )
     else:
+        # 기본: Shape, Pose, Global 모두 최적화
         full_state = run_optimization(
             mesh_points=mesh_points,
             smal_model=smal_model,
@@ -711,21 +1063,23 @@ def main():
             iterations=args.iterations,
             point_subset=min(2048, args.samples),
             device=device,
-            train_betas=True,
-            train_pose=True,
-            train_global=True,
+            train_betas=True,  # Shape 최적화
+            train_pose=True,   # Pose 최적화
+            train_global=True, # Scale/Translation 최적화
             anchor_cfg=ANCHOR_CONFIG,
             anchor_sigma=ANCHOR_SIGMA,
-            betas_prior=betas_init,
+            betas_prior=betas_init,  # Prior로 과도한 변형 방지
             pose_prior=body_pose_axis_init,
             symmetry_weight=SYMMETRY_WEIGHT,
         )
 
+        # 최종 결과 저장 (smal_fit_unity.obj가 최종 결과)
         export_results(
             smal_model=smal_model,
             state=full_state,
             output_dir=Path(args.output_dir),
             device=device,
+            target_points_cv=mesh_points,
         )
 
 

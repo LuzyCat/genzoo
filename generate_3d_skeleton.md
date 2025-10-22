@@ -94,7 +94,7 @@
       --iterations 100 \
       --samples 2048
   ```
-  - 유사변환 정합: Chamfer 0.051 → 포즈 단계 0.0327 → shape 단계 0.0260
-  - 익힌 가중치 덕분에 귀·발목 인근 오차가 감소, `pose_fit_unity.obj`, `shape_fit_unity.obj` 등 추가 산출
+  - 유사변환 정합: Chamfer 0.050 → 포즈 단계 0.0307 → shape 단계 0.0252 → 최종 `smal_fit_unity.obj` 0.0205
+  - 익힌 가중치 덕분에 귀·발목 인근 오차가 감소, `pose_fit_unity.obj`, `shape_fit_unity.obj`, `smal_fit_unity.obj` 순으로 세부 정렬 개선
   - 여전히 귀 끝/발굽 세부는 SMAL shape subspace 한계로 완전 일치하진 않음 → 추가 anchor 또는 개별 파라미터 필요
 - `hmr2/utils/pose_utils.compute_similarity_transform`를 활용해 anchor joint(머리/귀/앞·뒷다리) 중심으로 추정한 대응점에 대해 Procrustes 기반 초깃값(scale/rotation/translation)을 계산, bbox 기반 초기화의 불안정을 해소했다. `hmr2/utils/geometry`의 회전 변환과 기존 `batch_rodrigues`를 조합해 포즈·형상 업데이트를 수행했다.
