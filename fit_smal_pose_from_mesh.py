@@ -76,6 +76,7 @@ import torch
 import trimesh
 
 import sys
+from typing import List, Optional
 
 # 프로젝트 루트를 Python path에 추가 (genzoo, nature3d 패키지 import 위해)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -219,6 +220,7 @@ HEAD_ANCHOR_JOINTS = sorted(
 )
 FRONT_LEG_JOINTS = JOINT_CATEGORIES.get("front_legs", [])
 BACK_LEG_JOINTS = JOINT_CATEGORIES.get("back_legs", [])
+FOOT_JOINTS = [10, 14, 20, 24]  # L/R front & back feet indices
 
 ANCHOR_CONFIG = [
     {"name": "head", "joints": HEAD_ANCHOR_JOINTS, "weight": 2.5},  # 머리: 높은 가중치
@@ -230,6 +232,7 @@ ANCHOR_CONFIG = [
 ANCHOR_SIGMA = 0.08  # Anchor 영향 범위 (작을수록 영향 범위 좁음)
 SYMMETRY_WEIGHT = 0.02  # 좌우 대칭 loss 가중치
 SMAL_JOINT_PARENTS_TENSOR = torch.tensor(SMAL_JOINT_PARENTS, dtype=torch.long)
+FOOT_HEIGHT_WEIGHT = 0.05  # 발 위치를 타겟 메시 바닥에 맞추는 가중치
 
 
 def estimate_scale_from_bbox(
@@ -379,6 +382,70 @@ def compute_symmetry_penalty(joints: torch.Tensor) -> torch.Tensor:
     return torch.stack(penalties).mean()
 
 
+def compute_pose_regularization(body_pose_axis: torch.Tensor) -> torch.Tensor:
+    """
+    Pose 각도 제약 (다리 꼬임 방지)
+
+    각 joint의 rotation angle을 제한하여 비현실적인 자세 방지
+    특히 다리 joint에 대한 강한 제약 적용
+
+    Args:
+        body_pose_axis: Body pose axis-angle (1, J, 3)
+
+    Returns:
+        torch.Tensor: Pose regularization penalty
+    """
+    # Axis-angle의 norm = rotation angle (radians)
+    angles = body_pose_axis.norm(dim=-1)  # (1, J)
+
+    # 다리 joint 인덱스 (앞다리, 뒷다리)
+    leg_joints = [
+        6, 7, 8, 9, 10,    # 왼쪽 앞다리
+        11, 12, 13, 14, 15, # 오른쪽 앞다리
+        17, 18, 19, 20,    # 왼쪽 뒷다리
+        21, 22, 23, 24,    # 오른쪽 뒷다리
+    ]
+
+    penalties = []
+
+    # 다리 joint는 강한 제약 (90도 이상 회전하면 penalty)
+    max_leg_angle = torch.tensor(np.pi / 2, device=angles.device, dtype=angles.dtype)  # 90도
+    for idx in leg_joints:
+        if idx < angles.shape[1]:
+            excess = torch.relu(angles[0, idx] - max_leg_angle)
+            penalties.append(excess ** 2)
+
+    # 전체 joint는 약한 제약 (180도 이상 회전하면 penalty)
+    max_general_angle = torch.tensor(np.pi, device=angles.device, dtype=angles.dtype)  # 180도
+    excess_general = torch.relu(angles - max_general_angle)
+    penalties.append(excess_general.pow(2).mean())
+
+    if not penalties:
+        return torch.tensor(0.0, device=angles.device, dtype=angles.dtype)
+
+    return torch.stack(penalties).mean()
+
+
+def compute_foot_height_penalty(
+    joints: torch.Tensor,
+    target_points: torch.Tensor,
+    foot_indices: Optional[List[int]] = None,
+) -> torch.Tensor:
+    if target_points is None or target_points.numel() == 0:
+        return torch.tensor(0.0, device=joints.device, dtype=joints.dtype)
+
+    if foot_indices is None:
+        foot_indices = FOOT_JOINTS
+
+    valid_indices = [idx for idx in foot_indices if idx < joints.shape[0]]
+    if not valid_indices:
+        return torch.tensor(0.0, device=joints.device, dtype=joints.dtype)
+
+    max_y = target_points[:, 1].max()
+    foot_y = joints[valid_indices, 1]
+    return ((foot_y - max_y) ** 2).mean()
+
+
 def run_similarity_alignment(
     mesh_points: torch.Tensor,
     smal_model: SMALLayer,
@@ -454,9 +521,10 @@ def run_similarity_alignment(
         loss_xy = (weights_pred * dists.min(dim=1)[0]).sum() / weights_pred.sum()
         loss_yx = (weights_target * dists.min(dim=0)[0]).sum() / weights_target.sum()
         loss_data = loss_xy + loss_yx
+        foot_penalty = compute_foot_height_penalty(joints_current, target_points)
         loss_reg = 5e-5 * global_orient.pow(2).mean()
         loss_reg = loss_reg + 5e-2 * (scale - scale_init) ** 2
-        loss = loss_data + loss_reg
+        loss = loss_data + loss_reg + FOOT_HEIGHT_WEIGHT * foot_penalty
         loss.backward()
         optimiser.step()
 
@@ -661,17 +729,23 @@ def run_optimization(
         loss_yx = (weights_target * dists.min(dim=0)[0]).sum() / weights_target.sum()
         loss_data = loss_xy + loss_yx
 
+        foot_penalty = compute_foot_height_penalty(joints_current, target_points)
         loss_reg = torch.tensor(0.0, device=device, dtype=loss_data.dtype)
         if betas_prior is not None and train_betas:
             loss_reg = loss_reg + 5e-4 * (betas - betas_prior.to(device)).pow(2).mean()
         if pose_prior is not None and train_pose:
-            loss_reg = loss_reg + 2e-4 * (body_pose_axis - pose_prior.to(device)).pow(2).mean()
+            loss_reg = loss_reg + 5e-3 * (body_pose_axis - pose_prior.to(device)).pow(2).mean()  # 2e-4 -> 5e-3 (25배 증가)
         if train_global:
             loss_reg = loss_reg + 5e-5 * global_orient_axis.pow(2).mean()
         if symmetry_weight > 0:
             loss_reg = loss_reg + symmetry_weight * compute_symmetry_penalty(joints_current)
 
-        loss = loss_data + loss_reg
+        # 다리 꼬임 방지: Pose 각도 제약 추가
+        if train_pose:
+            pose_angle_penalty = compute_pose_regularization(body_pose_axis)
+            loss_reg = loss_reg + 0.05 * pose_angle_penalty
+
+        loss = loss_data + loss_reg + FOOT_HEIGHT_WEIGHT * foot_penalty
         loss.backward()
         optimiser.step()
 
@@ -871,6 +945,13 @@ def main():
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device for optimisation.",
+    )
+    parser.add_argument(
+        "--forward-axis",
+        type=str,
+        choices=["x", "y", "z"],
+        default="z",
+        help="Target forward axis for Unity export alignment.",
     )
     parser.add_argument(
         "--baseline-npz",
