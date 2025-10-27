@@ -46,10 +46,17 @@ def main():
     if args.folder:
         process_folder(args.input, args.output, args.mode, args.max_res)
     else:
+        # If output is a directory, use input filename
+        if os.path.isdir(args.output):
+            input_filename = os.path.basename(args.input)
+            output_path = os.path.join(args.output, input_filename)
+        else:
+            output_path = args.output
+
         img = Image.open(args.input)
         square_img = make_square_image(img, mode=args.mode, max_res=args.max_res)
-        square_img.save(args.output)
-        print(f"Saved: {args.output}")
+        square_img.save(output_path)
+        print(f"Saved: {output_path}")
 
 if __name__ == "__main__":
     main()
