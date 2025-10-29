@@ -1,0 +1,7 @@
+origin/Gyeongsan_Sapsal_Dog/origin.obj output_dir/Gyeongsan_Sapsal_Dog/animer.npz
+origin/Jeju_Black_Pig/origin_3.obj output_dir/Jeju_Black_Pig/animer.npz
+origin/Jeju_Black_Pig_A/origin.obj output_dir/Jeju_Black_Pig_A/animer.npz
+origin/Jeju_Horse/origin.obj output_dir/Jeju_Horse/animer.npz
+origin/Korean_Goral/origin_2.obj output_dir/Korean_Goral/animer.npz
+origin/Long-tailed_goral/origin.obj output_dir/Long-tailed_goral/animer.npz
+origin/Roe_Deer/origin.obj output_dir/Roe_deer/animer.npz

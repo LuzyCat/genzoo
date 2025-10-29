@@ -68,7 +68,7 @@ def build_smal_model(device: torch.device) -> SMPL:
     """
     Instantiate the SMAL model used by GenZoo without loading the full HMR2 network.
     """
-    cfg_path = Path("./data/genzoo_1M_config.yaml")
+    cfg_path = Path("/workspace/genzoo/data/genzoo_1M_config.yaml")
     model_cfg = get_config(str(cfg_path), update_cachedir=True)
     smpl_kwargs = {k.lower(): v for k, v in dict(model_cfg.SMPL).items()}
     model = SMPL(**smpl_kwargs)
@@ -284,8 +284,10 @@ def main():
                 print(f"⚠️  Skipping {base_name}: {exc}")
                 continue
 
-            thetas = inferred["pose_mats"]
+            pose_rotmat = inferred["pose_mats"]
             betas = inferred["betas"]
+            body_pose = inferred["body_pose"]
+            global_orient = inferred["global_orient"]
             verts = inferred["vertices"]
             keypoints_3d = inferred["joints"]
             s = np.array([inferred["scale"]], dtype=np.float32)
@@ -314,15 +316,25 @@ def main():
             betas = out["pred_smpl_params"]["betas"][0].cpu().numpy()
             body_pose = out["pred_smpl_params"]["body_pose"][0].cpu().numpy()
             global_orient = out["pred_smpl_params"]["global_orient"][0].cpu().numpy()
-            thetas = np.concatenate([global_orient, body_pose], axis=0)
+            pose_rotmat = np.concatenate([global_orient, body_pose], axis=0)
             s_px, tx_px, ty_px = convert_to_pixel_coords(s, tx, ty, resolution=W)
             keypoints_2d = weak_perspective_project(keypoints_3d, s_px, tx_px, ty_px)
             vertices_2d = weak_perspective_project(verts, s_px, tx_px, ty_px)
             transl = None
 
+        betas = betas.astype(np.float32)
+        body_pose = body_pose.astype(np.float32)
+        global_orient = global_orient.astype(np.float32)
+        pose_rotmat = pose_rotmat.astype(np.float32)
+
         data_payload = {
-            "pose": thetas.astype(np.float32),
-            "beta": betas.astype(np.float32),
+            "pose": pose_rotmat,
+            "pose_rotmat": pose_rotmat,
+            "pose_body": body_pose,
+            "body_pose": body_pose,
+            "global_orient": global_orient,
+            "betas": betas,
+            "beta": betas,
             "scale": s.astype(np.float32),
             "tx": tx.astype(np.float32),
             "ty": ty.astype(np.float32),

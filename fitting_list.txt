@@ -1,0 +1,7 @@
+origin/Gyeongsan_Sapsal_Dog/origin.obj genzoo/output/data/Gyeongsan_Sapsal_Dog.npz
+origin/Jeju_Black_Pig/origin_3.obj genzoo/output/data/Jeju_Black_Pig.npz
+origin/Jeju_Black_Pig_A/origin.obj genzoo/output/data/Jeju_Black_Pig_A.npz
+origin/Jeju_Horse/origin.obj genzoo/output/data/Jeju_Horse.npz
+origin/Korean_Goral/origin_2.obj genzoo/output/data/Korean_Goral.npz
+origin/Long-tailed_goral/origin.obj genzoo/output/data/Long-tailed_goral.npz
+origin/Roe_Deer/origin.obj genzoo/output/data/Roe_deer.npz

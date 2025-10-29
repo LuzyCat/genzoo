@@ -264,7 +264,11 @@ class MeshRenderer:
             return depth
     
         img_rgba, depth = self.renderer.render(self.scene, flags=pyrender.RenderFlags.RGBA)
-    
+
+        # Make a writable copy if the array is read-only
+        if not img_rgba.flags.writeable:
+            img_rgba = np.copy(img_rgba)
+
         alpha = (depth > 0).astype(np.uint8) * 255
         img_rgba[..., 3] = alpha
     

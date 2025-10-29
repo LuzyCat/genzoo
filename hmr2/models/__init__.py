@@ -33,7 +33,7 @@ def check_smpl_exists():
     candidates = [
         # f'{CACHE_DIR_4DHUMANS}/data/smpl/SMPL_NEUTRAL.pkl',
         # f'data/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl',
-        f'./data/smal_plus.pkl',
+        f'/workspace/genzoo/data/smal_plus.pkl',
     ]
     candidates_exist = [os.path.exists(c) for c in candidates]
     if not any(candidates_exist):
@@ -70,10 +70,10 @@ def load_hmr2(checkpoint_path=DEFAULT_CHECKPOINT):
     from pathlib import Path
     from ..configs import get_config
     # Hardcoded path to checkpoint to fix the issue with loading the model
-    hardcoded_checkpoint_path = './data/genzoo_1M.ckpt'
+    hardcoded_checkpoint_path = '/workspace/genzoo/data/genzoo_1M.ckpt'
     checkpoint_path = hardcoded_checkpoint_path
 
-    model_cfg = './data/genzoo_1M_config.yaml'
+    model_cfg = '/workspace/genzoo/data/genzoo_1M_config.yaml'
     model_cfg = get_config(model_cfg, update_cachedir=True)
 
     # Override some config values, to crop bbox correctly

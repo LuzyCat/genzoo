@@ -66,7 +66,7 @@ extras:
 exp_name: genzoo_1M
 SMPL:
   DATA_DIR: ${oc.env:HOME}/.cache/4DHumans/data/
-  MODEL_PATH: ./data/smal_plus.pkl
+  MODEL_PATH: /workspace/genzoo/data/smal_plus.pkl
   # GENDER: neutral
   NUM_BODY_JOINTS: 34
   # JOINT_REGRESSOR_EXTRA: ${SMPL.DATA_DIR}/SMPL_to_J19.pkl
@@ -102,7 +102,7 @@ MODEL:
   - 0.225
   BACKBONE:
     TYPE: vit
-    PRETRAINED_WEIGHTS: ./data/vitpose_backbone.pth
+    PRETRAINED_WEIGHTS: /workspace/genzoo/data/vitpose_backbone.pth
   SMPL_HEAD:
     TYPE: transformer_decoder
     IN_CHANNELS: 2048
