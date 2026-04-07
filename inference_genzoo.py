@@ -68,7 +68,7 @@ def build_smal_model(device: torch.device) -> SMPL:
     """
     Instantiate the SMAL model used by GenZoo without loading the full HMR2 network.
     """
-    cfg_path = Path("/workspace/genzoo/data/genzoo_1M_config.yaml")
+    cfg_path = Path(__file__).resolve().parent / 'data' / 'genzoo_1M_config.yaml'
     model_cfg = get_config(str(cfg_path), update_cachedir=True)
     smpl_kwargs = {k.lower(): v for k, v in dict(model_cfg.SMPL).items()}
     model = SMPL(**smpl_kwargs)
